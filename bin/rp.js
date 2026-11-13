@@ -35,6 +35,13 @@ const need = (a, k) => {
 async function main() {
   const a = args(process.argv.slice(2));
   const cmd = a._[0];
+  // launchd starts node itself (macOS lets a granted node read the external disk, not /bin/zsh).
+  // The phone is shared with other test runs, so tick-all re-runs itself inside the Mac's e2e lock.
+  const lock = path.join(require('node:os').homedir(), '.claude/bin/e2e-lock');
+  if (cmd === 'tick-all' && process.env.E2E_LOCK_HELD !== '1' && fs.existsSync(lock)) {
+    process.exitCode = require('node:child_process').spawnSync(lock, ['--', `"${process.execPath}" "${__filename}" tick-all`], { stdio: 'inherit' }).status ?? 1;
+    return;
+  }
   if (['tick', 'tick-all', 'status', 'approve', 'retest'].includes(cmd)) return runnerCommand(cmd, a);
   const key = a.key || process.env.PLAY_SERVICE_ACCOUNT;
   if (!key) throw new Error('set --key or PLAY_SERVICE_ACCOUNT');
