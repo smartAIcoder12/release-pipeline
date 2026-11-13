@@ -1,0 +1,130 @@
+# Reusable workflow: checks, build, sign and upload an Expo Android app to a Play test track.
+# The candidate then waits there for the phone test on the Mac (see README). Production is never
+# touched here: a tested versionCode is promoted later, without a rebuild.
+#
+# In the app repo:
+#   jobs:
+#     android:
+#       uses: smartAIcoder12/release-pipeline/.github/workflows/android.yml@main
+#       with: { package: com.example.app, upload-sha1: "2D:7C:..." }
+#       secrets: inherit   (or map each secret below by name)
+#
+# Secrets in the app repo: PLAY_SERVICE_ACCOUNT (JSON), APP_ENV (.env text, EXPO_PUBLIC_* only),
+# UPLOAD_JKS_BASE64, UPLOAD_STORE_PASSWORD, UPLOAD_KEY_ALIAS, UPLOAD_KEY_PASSWORD.
+# The app's Gradle signing must read the Gradle properties UPLOAD_STORE_FILE, UPLOAD_STORE_PASSWORD,
+# UPLOAD_KEY_ALIAS and UPLOAD_KEY_PASSWORD under the prefix given in `signing-prefix`.
+name: Android candidate
+
+on:
+  workflow_call:
+    inputs:
+      package: { type: string, required: true }
+      upload-sha1: { type: string, required: true, description: "SHA-1 of the upload key; the build stops if the AAB is signed with anything else" }
+      signing-prefix: { type: string, default: "", description: "Gradle property prefix, e.g. LISTSOEASY_ for LISTSOEASY_UPLOAD_STORE_FILE" }
+      track: { type: string, default: internal }
+      release-status: { type: string, default: completed, description: "draft until the app's first production release is published" }
+      check-command: { type: string, default: "npm test --silent && npx tsc --noEmit && npx expo lint" }
+      pipeline-ref: { type: string, default: main }
+    secrets:
+      PLAY_SERVICE_ACCOUNT: { required: true }
+      APP_ENV: { required: true }
+      UPLOAD_JKS_BASE64: { required: true }
+      UPLOAD_STORE_PASSWORD: { required: true }
+      UPLOAD_KEY_ALIAS: { required: true }
+      UPLOAD_KEY_PASSWORD: { required: true }
+    outputs:
+      version-code:
+        value: ${{ jobs.android.outputs.version-code }}
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      version-code: ${{ steps.code.outputs.code }}
+    steps:
+      - uses: actions/checkout@v5
+        with: { fetch-depth: 2 }
+
+      # A commit from the pipeline's fixer may not touch the smoke flows or CI: a person decides those.
+      - name: Guard fix commits
+        run: |
+          if git log -1 --format=%s | grep -q '^\[release-fix\]'; then
+            BAD=$(git diff --name-only HEAD~1 HEAD | grep -E '^(e2e/smoke/|\.github/)' || true)
+            [ -z "$BAD" ] || { echo "release-fix commit changes protected files: $BAD"; exit 1; }
+          fi
+
+      - uses: actions/checkout@v5
+        with: { repository: smartAIcoder12/release-pipeline, ref: "${{ inputs.pipeline-ref }}", path: .release-pipeline }
+
+      # Git dependencies (i18n-guard) are pinned as git+ssh in package-lock; the runner has no SSH key.
+      - run: git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+
+      - uses: actions/setup-node@v5
+        with: { node-version: 22, cache: npm }
+
+      - uses: actions/setup-java@v5
+        with: { distribution: temurin, java-version: 21 }
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - run: npm ci
+
+      - name: Write .env
+        env: { APP_ENV: "${{ secrets.APP_ENV }}" }
+        run: printf '%s\n' "$APP_ENV" > .env
+
+      - name: Checks
+        run: ${{ inputs.check-command }}
+
+      - name: Next versionCode from Play
+        id: code
+        env: { PLAY_SERVICE_ACCOUNT: "${{ secrets.PLAY_SERVICE_ACCOUNT }}" }
+        run: |
+          CODE=$(node .release-pipeline/bin/rp.js next-code --package "${{ inputs.package }}")
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "ANDROID_VERSION_CODE=$CODE" >> "$GITHUB_ENV"
+          echo "versionCode $CODE"
+
+      - run: npx expo prebuild --platform android --no-install
+
+      - name: Build AAB
+        working-directory: android
+        env:
+          JKS_BASE64: ${{ secrets.UPLOAD_JKS_BASE64 }}
+          P: ${{ inputs.signing-prefix }}
+          STORE_PASSWORD: ${{ secrets.UPLOAD_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.UPLOAD_KEY_PASSWORD }}
+        run: |
+          echo "$JKS_BASE64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+          ./gradlew bundleRelease --no-daemon \
+            "-P${P}UPLOAD_STORE_FILE=$RUNNER_TEMP/upload.jks" \
+            "-P${P}UPLOAD_STORE_PASSWORD=$STORE_PASSWORD" \
+            "-P${P}UPLOAD_KEY_ALIAS=$KEY_ALIAS" \
+            "-P${P}UPLOAD_KEY_PASSWORD=$KEY_PASSWORD"
+          rm -f "$RUNNER_TEMP/upload.jks"
+
+      - name: Verify signature and versionCode
+        run: |
+          AAB=android/app/build/outputs/bundle/release/app-release.aab
+          SHA1=$(keytool -printcert -jarfile "$AAB" | awk '/SHA1:/ {print $2; exit}')
+          [ "$SHA1" = "${{ inputs.upload-sha1 }}" ] || { echo "AAB signed with $SHA1, expected ${{ inputs.upload-sha1 }}"; exit 1; }
+          grep -q "versionCode ${{ steps.code.outputs.code }}" android/app/build.gradle || { echo "app.config does not use ANDROID_VERSION_CODE"; exit 1; }
+
+      - name: Upload to Play (${{ inputs.track }})
+        env: { PLAY_SERVICE_ACCOUNT: "${{ secrets.PLAY_SERVICE_ACCOUNT }}" }
+        run: |
+          node .release-pipeline/bin/rp.js upload --package "${{ inputs.package }}" \
+            --aab android/app/build/outputs/bundle/release/app-release.aab \
+            --track "${{ inputs.track }}" --status "${{ inputs.release-status }}" \
+            --name "${{ steps.code.outputs.code }} (${GITHUB_SHA::7})"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aab-${{ steps.code.outputs.code }}
+          path: android/app/build/outputs/bundle/release/app-release.aab
+          retention-days: 30
+
+      - name: Summary
+        run: echo "Uploaded versionCode ${{ steps.code.outputs.code }} from ${GITHUB_SHA::7} to ${{ inputs.track }} (${{ inputs.release-status }})." >> "$GITHUB_STEP_SUMMARY"
